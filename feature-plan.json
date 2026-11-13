@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "current_feature": "fix-skill-creator-parallel-eval",
+  "features": [
+    {
+      "id": "fix-skill-creator-parallel-eval",
+      "title": "Isolate eval queries per temporary project to avoid cross-matching",
+      "status": "in_progress",
+      "acceptance": [
+        "Each query command file is isolated in its own temporary directory",
+        "Parallel runs do not interfere; each claude -p invocation sees only its own command"
+      ],
+      "implementation": ["skill-creator/scripts/run_eval.py"],
+      "tests": ["python -m py_compile skill-creator/scripts/run_eval.py"]
+    }
+  ]
+}
