@@ -10,7 +10,7 @@ fix-skill-creator-parallel-eval
 
 ### fix-skill-creator-parallel-eval — Isolate eval queries per temporary project to avoid cross-matching
 
-Status: in_progress
+Status: done
 
 Acceptance:
 - Each query command file is isolated in its own temporary directory

@@ -5,7 +5,7 @@
     {
       "id": "fix-skill-creator-parallel-eval",
       "title": "Isolate eval queries per temporary project to avoid cross-matching",
-      "status": "in_progress",
+      "status": "done",
       "acceptance": [
         "Each query command file is isolated in its own temporary directory",
         "Parallel runs do not interfere; each claude -p invocation sees only its own command"
