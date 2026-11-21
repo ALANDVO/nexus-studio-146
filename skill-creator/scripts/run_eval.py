@@ -1,43 +1,74 @@
 #!/usr/bin/env python3
-# Skeleton for run_eval.py fix: isolate each query in its own temp directory.
-# TODO: implement run_single_query with isolation.
+"""Evaluate how reliably a skill description triggers a skill.
+
+Each query is isolated in its own temporary project directory so that parallel
+runs never see a sibling worker's command file. Cross-matching between workers
+was the cause of near-zero trigger rates in earlier versions.
+
+The ``claude`` CLI is invoked through an injectable runner so the measurement
+logic can be tested without a network round trip or a model.
+"""
 
 import json
-import tempfile
+import os
 import shutil
-from pathlib import Path
+import subprocess
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+TRIGGER_MARKER = "SKILL_TRIGGERED"
 
 
-def run_single_query(query_idx, skill_name, description, should_trigger, num_workers):
-    """Run a single eval query with isolation in a temp directory."""
-    # Create an isolated temporary project directory
+class EvalError(RuntimeError):
+    """Raised when the eval input is invalid."""
+
+
+def build_command_content(skill_name, description, query_idx):
+    """Build the markdown command file handed to the skill loader."""
+    return (
+        f"# Skill: {skill_name}\n\n"
+        f"Description: {description}\n\n"
+        "## Auto-generated for evaluation\n\n"
+        f"Query: {query_idx}\n\n"
+        f"Trigger marker: {TRIGGER_MARKER}\n"
+    )
+
+
+def claude_runner(command_text, project_root, timeout=30):
+    """Default runner: invoke the ``claude`` CLI inside ``project_root``."""
+    return subprocess.run(
+        ["claude", "-p", command_text],
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=dict(os.environ),
+    )
+
+
+def parse_output(stdout):
+    """Return True when the output shows the skill was invoked."""
+    return TRIGGER_MARKER in (stdout or "")
+
+
+def run_single_query(query_idx, skill_name, description, should_trigger, runner=None):
+    """Run one query in a fresh temp project; return a result dict."""
+    runner = runner or claude_runner
     iso_root = Path(tempfile.mkdtemp(prefix="trigeval-"))
     try:
-        project_commands_dir = iso_root / ".claude" / "commands"
-        project_commands_dir.mkdir(parents=True, exist_ok=True)
+        commands_dir = iso_root / ".claude" / "commands"
+        commands_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build command file content
         clean_name = f"{skill_name}-skill-{query_idx}"
-        command_file = project_commands_dir / f"{clean_name}.md"
-        command_file.write_text(f"# Skill: {skill_name}\n\nDescription: {description}\n\n## Auto-generated for evaluation\n")
-
-        # Build environment pointing to the isolated commands dir
-        env = dict(__import__("os").environ)
-
-        # Run claude -p with the isolated project
-        import subprocess
-        result = subprocess.run(
-            ["claude", "-p", description],
-            cwd=str(iso_root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
+        command_file = commands_dir / f"{clean_name}.md"
+        command_file.write_text(
+            build_command_content(skill_name, description, query_idx), encoding="utf-8"
         )
 
-        # Check if the skill was triggered by searching output for the clean_name
-        triggered = clean_name in result.stdout or clean_name in result.stderr
+        completed = runner(description, iso_root)
+        stdout = getattr(completed, "stdout", "") or ""
+        triggered = parse_output(stdout)
 
         return {
             "query_idx": query_idx,
@@ -45,67 +76,81 @@ def run_single_query(query_idx, skill_name, description, should_trigger, num_wor
             "description": description,
             "should_trigger": should_trigger,
             "triggered": triggered,
-            "output_snippet": result.stdout[-200:] if result.stdout else "",
+            "expected": "positive" if should_trigger else "negative",
+            "verdict": (
+                "correct"
+                if triggered == should_trigger
+                else "false-negative"
+                if should_trigger
+                else "false-positive"
+            ),
+            "output_snippet": stdout[-200:],
+            "returncode": getattr(completed, "returncode", None),
         }
     finally:
         shutil.rmtree(iso_root, ignore_errors=True)
 
 
-def run_eval(skill_name, descriptions, should_trigger_list=None, num_workers=4):
-    """Run eval with isolated temp directories per query."""
+def run_eval(
+    skill_name,
+    descriptions,
+    should_trigger_list=None,
+    num_workers=4,
+    runner=None,
+):
+    """Run all queries, optionally in parallel, and summarize the outcome."""
+    if not skill_name:
+        raise EvalError("skill_name is required")
+    if not descriptions:
+        raise EvalError("descriptions must not be empty")
     if should_trigger_list is None:
         should_trigger_list = [True] * len(descriptions)
+    if len(should_trigger_list) != len(descriptions):
+        raise EvalError("should_trigger_list length must match descriptions")
 
-    positives = []
-    negatives = []
-    results = []
+    num_workers = max(1, min(int(num_workers), len(descriptions)))
 
-    for idx, (desc, should_trigger) in enumerate(zip(descriptions, should_trigger_list)):
-        if should_trigger:
-            positives.append(idx)
-        else:
-            negatives.append(idx)
+    results = [None] * len(descriptions)
+    if num_workers == 1 or runner is not None:
+        for idx, (desc, should) in enumerate(zip(descriptions, should_trigger_list)):
+            results[idx] = run_single_query(idx, skill_name, desc, should, runner)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(
+                    run_single_query, idx, skill_name, desc, should, None
+                ): idx
+                for idx, (desc, should) in enumerate(
+                    zip(descriptions, should_trigger_list)
+                )
+            }
+            for future, idx in futures.items():
+                results[idx] = future.result()
 
-    # Run queries in parallel with isolation
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = []
-        for idx, (desc, should_trigger) in enumerate(zip(descriptions, should_trigger_list)):
-            future = executor.submit(
-                run_single_query, idx, skill_name, desc, should_trigger, num_workers
-            )
-            futures.append(future)
-
-        for future in futures:
-            result = future.result()
-            results.append(result)
-            if result["should_trigger"] and result["triggered"]:
-                pass  # correct positive
-            elif not result["should_trigger"] and not result["triggered"]:
-                pass  # correct negative
-            elif result["should_trigger"] and not result["triggered"]:
-                pass  # false negative (should trigger but didn't)
-            elif not result["should_trigger"] and result["triggered"]:
-                pass  # false positive (triggered when shouldn't)
-
-    triggered_count = sum(1 for r in results if r["should_trigger"] and r["triggered"])
+    positives = [r for r in results if r["should_trigger"]]
+    negatives = [r for r in results if not r["should_trigger"]]
+    triggered_positives = sum(1 for r in positives if r["triggered"])
+    triggered_negatives = sum(1 for r in negatives if r["triggered"])
 
     return {
         "skill_name": skill_name,
         "total_queries": len(results),
-        "triggered_count": triggered_count,
+        "triggered_count": triggered_positives,
+        "trigger_rate": (triggered_positives / len(positives)) if positives else None,
+        "false_positive_count": triggered_negatives,
+        "false_negative_count": len(positives) - triggered_positives,
         "results": results,
     }
 
 
 if __name__ == "__main__":
-    # Example usage
-    skill_name = "test-skill"
-    descriptions = [
-        "I need to use the skill right now",
-        "Can you help me with this task?",
-        "Run the skill please",
-    ]
-    should_trigger_list = [True, False, True]
-
-    result = run_eval(skill_name, descriptions, should_trigger_list, num_workers=4)
+    result = run_eval(
+        "test-skill",
+        [
+            "I need to use the skill right now",
+            "Can you help me with this task?",
+            "Run the skill please",
+        ],
+        [True, False, True],
+    )
     print(json.dumps(result, indent=2))
