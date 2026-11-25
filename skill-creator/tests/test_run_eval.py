@@ -83,5 +83,23 @@ class EvalSummaryTest(unittest.TestCase):
             run_eval.run_eval("alpha", [], num_workers=1, runner=make_runner(False))
 
 
+
+    def test_parallel_with_runner_forces_sequential(self):
+        """Verify that num_workers > 1 with runner not None forces sequential execution."""
+        runner = make_runner(True)
+
+        descriptions = ["desc1", "desc2", "desc3"]
+        should_trigger = [True, False, True]
+
+        summary = run_eval.run_eval(
+            "test-skill", descriptions, should_trigger, num_workers=4, runner=runner
+        )
+
+        self.assertEqual(summary["total_queries"], 3)
+        self.assertEqual(summary["triggered_count"], 2)
+        self.assertAlmostEqual(summary["trigger_rate"], 1.0)
+        self.assertEqual(summary["false_positive_count"], 1)
+        self.assertEqual(summary["false_negative_count"], 0)
+        self.assertEqual([r["verdict"] for r in summary["results"]], ["correct", "false-positive", "correct"])
 if __name__ == "__main__":
     unittest.main()
